@@ -11,8 +11,30 @@ env:
   ACR_NAME: ${{ secrets.ACR_NAME }}
 
 jobs:
+  # ── Step 0: Run test suite ───────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: pip install -e "temporal[test]"
+      - name: Run test suite
+        run: |
+          cd temporal
+          python -m pytest tests/ -v --tb=short --junit-xml=test-results.xml
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: temporal/test-results.xml
+
   # ── Step 1: Build and push Docker images ────────────────────────────────────
   build:
+    needs: test
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.tag.outputs.tag }}
