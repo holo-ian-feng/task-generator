@@ -34,7 +34,7 @@ service_payload = {
 anon_key     = jwt.encode(anon_payload,    JWT_SECRET, algorithm="HS256")
 service_key  = jwt.encode(service_payload, JWT_SECRET, algorithm="HS256")
 
-print("=== Add these to GitHub Secrets (Settings → Secrets → Actions) ===\n")
+print("=== Add these to GitHub Secrets (Settings -> Secrets -> Actions) ===\n")
 print(f"JWT_SECRET={JWT_SECRET}")
 print(f"ANON_KEY={anon_key}")
 print(f"SERVICE_ROLE_KEY={service_key}")
