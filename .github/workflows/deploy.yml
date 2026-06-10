@@ -1,0 +1,294 @@
+name: Build & Deploy to Azure Container Apps
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP }}
+  ENV_NAME: ${{ secrets.ENV_NAME }}
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+
+jobs:
+  # ── Step 1: Build and push Docker images ────────────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.tag }}
+      kong_fqdn: ${{ steps.kong.outputs.fqdn }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: tag
+        run: echo "tag=$(echo $GITHUB_SHA | head -c7)" >> $GITHUB_OUTPUT
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Log in to ACR
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      # Get Kong FQDN so the frontend can be built with the correct VITE_SUPABASE_URL
+      - name: Get Kong FQDN
+        id: kong
+        run: |
+          FQDN=$(az containerapp show \
+            --name supabase-kong \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv 2>/dev/null || echo "pending")
+          echo "fqdn=$FQDN" >> $GITHUB_OUTPUT
+          echo "Kong FQDN: $FQDN"
+
+      - name: Build & push temporal-worker
+        run: |
+          IMAGE=${{ env.ACR_NAME }}.azurecr.io/temporal-worker:${{ steps.tag.outputs.tag }}
+          docker build -t $IMAGE ./temporal
+          docker push $IMAGE
+
+      - name: Build & push Kong (Supabase API gateway)
+        run: |
+          IMAGE=${{ env.ACR_NAME }}.azurecr.io/supabase-kong:${{ steps.tag.outputs.tag }}
+          docker build -t $IMAGE ./supabase/kong
+          docker push $IMAGE
+
+      - name: Build & push frontend
+        run: |
+          IMAGE=${{ env.ACR_NAME }}.azurecr.io/frontend:${{ steps.tag.outputs.tag }}
+          KONG_FQDN=${{ steps.kong.outputs.fqdn }}
+          SUPABASE_URL=$([ "$KONG_FQDN" = "pending" ] && echo "http://supabase-kong:8000" || echo "https://$KONG_FQDN")
+          docker build \
+            --build-arg VITE_SUPABASE_URL=$SUPABASE_URL \
+            --build-arg VITE_SUPABASE_ANON_KEY=${{ secrets.ANON_KEY }} \
+            --build-arg VITE_API_URL=$SUPABASE_URL/functions/v1 \
+            -t $IMAGE ./frontend
+          docker push $IMAGE
+
+  # ── Step 2: Deploy / update each Container App ──────────────────────────────
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy Supabase DB
+        run: |
+          az containerapp create \
+            --name supabase-db \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --image supabase/postgres:15.6.1.143 \
+            --ingress internal --target-port 5432 \
+            --min-replicas 1 --max-replicas 1 \
+            --env-vars \
+              POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }} \
+              PGPASSWORD=${{ secrets.POSTGRES_PASSWORD }} \
+              JWT_SECRET=${{ secrets.JWT_SECRET }} \
+            2>/dev/null || \
+          az containerapp update \
+            --name supabase-db \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image supabase/postgres:15.6.1.143
+
+      - name: Run DB migrations
+        run: |
+          # Concatenate all migration files and run via psql in a temporary container
+          cat supabase/migrations/*.sql > /tmp/all-migrations.sql
+          az containerapp job create \
+            --name db-migrate-$(date +%s) \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --trigger-type Manual \
+            --replica-timeout 300 \
+            --image postgres:15-alpine \
+            --env-vars PGPASSWORD=${{ secrets.POSTGRES_PASSWORD }} \
+            --command "sh" "--" "-c" \
+            "sleep 5 && psql -h supabase-db -U postgres -d postgres -c '$(cat /tmp/all-migrations.sql | tr "'" "''")'" \
+            2>/dev/null | true
+
+      - name: Deploy Supabase Auth (GoTrue)
+        run: |
+          az containerapp create \
+            --name supabase-auth \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --image supabase/gotrue:v2.158.4 \
+            --ingress internal --target-port 9999 \
+            --min-replicas 1 --max-replicas 1 \
+            --env-vars \
+              GOTRUE_API_HOST=0.0.0.0 \
+              GOTRUE_API_PORT=9999 \
+              API_EXTERNAL_URL=https://supabase-kong \
+              GOTRUE_DB_DRIVER=postgres \
+              "GOTRUE_DB_DATABASE_URL=postgres://supabase_auth_admin:${{ secrets.POSTGRES_PASSWORD }}@supabase-db:5432/postgres" \
+              GOTRUE_SITE_URL=${{ secrets.SITE_URL }} \
+              GOTRUE_DISABLE_SIGNUP=false \
+              GOTRUE_JWT_ADMIN_ROLES=service_role \
+              GOTRUE_JWT_AUD=authenticated \
+              GOTRUE_JWT_DEFAULT_GROUP_NAME=authenticated \
+              GOTRUE_JWT_EXP=3600 \
+              GOTRUE_JWT_SECRET=${{ secrets.JWT_SECRET }} \
+              GOTRUE_MAILER_AUTOCONFIRM=true \
+              GOTRUE_EXTERNAL_PHONE_ENABLED=false \
+            2>/dev/null || \
+          az containerapp update \
+            --name supabase-auth \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image supabase/gotrue:v2.158.4
+
+      - name: Deploy PostgREST
+        run: |
+          az containerapp create \
+            --name supabase-rest \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --image postgrest/postgrest:v12.2.0 \
+            --ingress internal --target-port 3000 \
+            --min-replicas 1 --max-replicas 2 \
+            --env-vars \
+              "PGRST_DB_URI=postgres://authenticator:${{ secrets.POSTGRES_PASSWORD }}@supabase-db:5432/postgres" \
+              PGRST_DB_SCHEMAS=public \
+              PGRST_DB_ANON_ROLE=anon \
+              PGRST_JWT_SECRET=${{ secrets.JWT_SECRET }} \
+              PGRST_DB_USE_LEGACY_GUCS=false \
+            --command postgrest \
+            2>/dev/null || \
+          az containerapp update \
+            --name supabase-rest \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image postgrest/postgrest:v12.2.0
+
+      - name: Deploy Kong (API gateway)
+        run: |
+          IMAGE=${{ env.ACR_NAME }}.azurecr.io/supabase-kong:${{ needs.build.outputs.image_tag }}
+          az containerapp create \
+            --name supabase-kong \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --image $IMAGE \
+            --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+            --registry-username ${{ env.ACR_NAME }} \
+            --registry-password ${{ secrets.ACR_PASSWORD }} \
+            --ingress external --target-port 8000 \
+            --min-replicas 1 --max-replicas 2 \
+            --env-vars \
+              KONG_DATABASE=off \
+              KONG_DECLARATIVE_CONFIG=/var/lib/kong/kong.yml \
+              KONG_DNS_ORDER=LAST,A,CNAME \
+              KONG_PLUGINS=request-transformer,cors,key-auth,acl \
+            2>/dev/null || \
+          az containerapp update \
+            --name supabase-kong \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image $IMAGE
+
+      - name: Deploy Temporal DB
+        run: |
+          az containerapp create \
+            --name temporal-db \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --image postgres:15-alpine \
+            --ingress internal --target-port 5432 \
+            --min-replicas 1 --max-replicas 1 \
+            --env-vars \
+              POSTGRES_USER=temporal \
+              POSTGRES_PASSWORD=${{ secrets.TEMPORAL_DB_PASSWORD }} \
+              POSTGRES_DB=temporal \
+            2>/dev/null || true
+
+      - name: Deploy Temporal Server
+        run: |
+          az containerapp create \
+            --name temporal \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --image temporalio/auto-setup:1.21.3 \
+            --ingress internal --target-port 7233 \
+            --min-replicas 1 --max-replicas 1 \
+            --env-vars \
+              DB=postgresql \
+              DB_PORT=5432 \
+              POSTGRES_USER=temporal \
+              POSTGRES_PWD=${{ secrets.TEMPORAL_DB_PASSWORD }} \
+              POSTGRES_SEEDS=temporal-db \
+            2>/dev/null || true
+
+      - name: Deploy Temporal UI
+        run: |
+          az containerapp create \
+            --name temporal-ui \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --image temporalio/ui:2.21.2 \
+            --ingress external --target-port 8080 \
+            --min-replicas 1 --max-replicas 1 \
+            --env-vars \
+              TEMPORAL_ADDRESS=temporal:7233 \
+              "TEMPORAL_CORS_ORIGINS=*" \
+            2>/dev/null || true
+
+      - name: Deploy Temporal Worker
+        run: |
+          IMAGE=${{ env.ACR_NAME }}.azurecr.io/temporal-worker:${{ needs.build.outputs.image_tag }}
+          az containerapp create \
+            --name temporal-worker \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --image $IMAGE \
+            --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+            --registry-username ${{ env.ACR_NAME }} \
+            --registry-password ${{ secrets.ACR_PASSWORD }} \
+            --ingress none \
+            --min-replicas 1 --max-replicas 1 \
+            --env-vars \
+              TEMPORAL_ADDRESS=temporal:7233 \
+              TEMPORAL_NAMESPACE=default \
+              TEMPORAL_TASK_QUEUE=main \
+              SUPABASE_URL=http://supabase-kong:8000 \
+              SUPABASE_SERVICE_ROLE_KEY=${{ secrets.SERVICE_ROLE_KEY }} \
+              AZURE_AI_ENDPOINT=${{ secrets.AZURE_AI_ENDPOINT }} \
+              AZURE_AI_KEY=${{ secrets.AZURE_AI_KEY }} \
+              AZURE_AI_MODEL=${{ secrets.AZURE_AI_MODEL }} \
+            2>/dev/null || \
+          az containerapp update \
+            --name temporal-worker \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image $IMAGE
+
+      - name: Deploy Frontend
+        run: |
+          IMAGE=${{ env.ACR_NAME }}.azurecr.io/frontend:${{ needs.build.outputs.image_tag }}
+          az containerapp create \
+            --name frontend \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --environment ${{ env.ENV_NAME }} \
+            --image $IMAGE \
+            --registry-server ${{ env.ACR_NAME }}.azurecr.io \
+            --registry-username ${{ env.ACR_NAME }} \
+            --registry-password ${{ secrets.ACR_PASSWORD }} \
+            --ingress external --target-port 3000 \
+            --min-replicas 1 --max-replicas 2 \
+            2>/dev/null || \
+          az containerapp update \
+            --name frontend \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image $IMAGE
+
+      - name: Print service URLs
+        run: |
+          echo "=== Deployed Service URLs ==="
+          echo "Frontend:    https://$(az containerapp show --name frontend --resource-group ${{ env.RESOURCE_GROUP }} --query properties.configuration.ingress.fqdn -o tsv)"
+          echo "Supabase:    https://$(az containerapp show --name supabase-kong --resource-group ${{ env.RESOURCE_GROUP }} --query properties.configuration.ingress.fqdn -o tsv)"
+          echo "Temporal UI: https://$(az containerapp show --name temporal-ui --resource-group ${{ env.RESOURCE_GROUP }} --query properties.configuration.ingress.fqdn -o tsv)"

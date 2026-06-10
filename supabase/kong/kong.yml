@@ -1,0 +1,68 @@
+_format_version: "1.1"
+
+# Routes /auth/v1/* to GoTrue and /rest/v1/* to PostgREST.
+# JWT verification is handled by PostgREST itself (PGRST_JWT_SECRET).
+# Kong is responsible for routing and CORS only.
+
+services:
+  - name: auth-v1
+    url: http://supabase-auth:9999/
+    routes:
+      - name: auth-v1
+        strip_path: true
+        paths:
+          - /auth/v1/
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - "*"
+          methods:
+            - GET
+            - POST
+            - PATCH
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Accept
+            - Authorization
+            - Content-Type
+            - Apikey
+            - X-Client-Info
+          exposed_headers:
+            - X-Auth-Token
+          credentials: true
+          max_age: 3600
+
+  - name: rest-v1
+    url: http://supabase-rest:3000/
+    routes:
+      - name: rest-v1
+        strip_path: true
+        paths:
+          - /rest/v1/
+    plugins:
+      - name: cors
+        config:
+          origins:
+            - "*"
+          methods:
+            - GET
+            - POST
+            - PATCH
+            - PUT
+            - DELETE
+            - OPTIONS
+          headers:
+            - Accept
+            - Authorization
+            - Content-Type
+            - Apikey
+            - X-Client-Info
+            - Prefer
+          exposed_headers:
+            - Content-Range
+            - X-Auth-Token
+          credentials: true
+          max_age: 3600
